@@ -58,7 +58,8 @@ These are the product decisions this architecture is built against. Changing any
         ┌──────────────────────────────────────────────┐
         │              Write Path (async)                │
         │  Post created → posts table → FanoutPostJob     │
-        │  → queue → LPUSH into each follower's Redis list│
+        │  → queue → ZADD into each follower's feed set   │
+        │  (Follow action → same path, backfilled, §5.1)  │
         └──────────────────────────────────────────────┘
 ```
 
@@ -110,21 +111,40 @@ No engagement tables (likes/comments), no media tables — deliberately excluded
 
 ## 5. Feed Generation: Push Model (Fan-out on Write)
 
-Chosen deliberately over the pull model, given the 10:1 read-heavy ratio — the cost of fan-out is paid once at write time so every subsequent read is a cheap Redis list fetch.
+Chosen deliberately over the pull model, given the 10:1 read-heavy ratio — the cost of fan-out is paid once at write time so every subsequent read is a cheap Redis fetch.
+
+**Data structure: sorted set, not a plain list.** The original notes used a Redis List (`LPUSH` / `LTRIM`), which works fine as long as posts are always inserted in the order they happen. It breaks the moment a post needs to be inserted *out of order* — which is exactly what backfilling an old post into a newly-followed user's feed requires (Section 5.1). A List has no way to insert "in the middle, by timestamp." A **sorted set** does: `user:{id}:feed` is a ZSET where the score is the post's `created_at` (unix timestamp) and the member is the `post_id`. Any post — new or backfilled — lands in the right position purely from its score, regardless of insertion order.
 
 **Write path:**
 1. Post is saved to the `posts` table (source of truth).
 2. A `FanoutPostJob` is dispatched to a queue — publishing a post must never block on fan-out.
 3. The job loads the author's follower IDs from `follows`.
-4. For each follower, `LPUSH user:{follower_id}:feed {post_id}`.
-5. `LTRIM user:{follower_id}:feed 0 799` — caps each cached feed at 800 entries so Redis memory stays bounded per user.
+4. For each follower, `ZADD user:{follower_id}:feed {created_at} {post_id}`.
+5. `ZREMRANGEBYRANK user:{follower_id}:feed 0 -801` — trims each set down to the newest 800 entries so Redis memory stays bounded per user.
 
 **Read path:**
-1. Feed request fetches `user:{id}:feed` from Redis — a list of post IDs, no join needed.
+1. Feed request fetches the latest page via `ZREVRANGE user:{id}:feed 0 19` — newest-first, no join needed.
 2. Post IDs are hydrated (batch fetch from `posts` or a post cache).
 3. Hydrated posts are handed to the blending layer (Section 6).
 
 Storing IDs rather than full post bodies in Redis keeps the cache small and avoids data duplication/staleness if a post is edited or deleted.
+
+### 5.1 Backfill on Follow
+
+**The gap:** fan-out only pushes a post to followers who existed *at the time the post was published*. If A follows B today, B's fan-out from last week never touched A's feed set — A's feed would show nothing from B until B's *next* post. For a feed product, a newly-followed account showing up empty reads as broken, not as a technical nuance, so this is worth fixing rather than accepting.
+
+**Solution:** treat "follow" as its own fan-out trigger, symmetric to "post created," just scoped to one user instead of many.
+
+1. Follow action is saved to the `follows` table (via the Livewire "Follow" button).
+2. A `FollowBackfillJob(follower_id, followee_id)` is dispatched to the queue — same reasoning as post fan-out: don't make the follow action wait on it.
+3. The job fetches the followee's **most recent K posts** (e.g. K = 30) from `posts` — bounded, not their full history, since a feed shows recent activity, not an archive.
+4. Each fetched post is `ZADD`ed into `user:{follower_id}:feed` with its original `created_at` as the score.
+5. Because it's a sorted set, these backfilled posts land at their correct chronological position automatically — no risk of an old post jumping to the top the way it would with `LPUSH`.
+6. The existing `ZREMRANGEBYRANK` trim still applies, so backfilling a very active account can't blow past the 800-entry cap.
+
+**Bounding K matters for cost.** Backfill is O(K) per follow action, not O(follower's entire history) and not O(followee's follower count) — so it stays cheap even for a follow-count spike, unlike the celebrity fan-out problem in Section 9, which is O(followers).
+
+**Unfollow (not symmetric, by design):** an unfollow does *not* proactively scrub the followee's post IDs out of the follower's feed set. Actively removing them would mean scanning/removing by author across the whole set — real cost for a rare action. Instead, stale posts simply age out naturally via the normal 800-entry trim and stop being replaced (no more fan-out from that author). Acceptable trade-off for MVP scope; worth revisiting only if user complaints about "unfollowed but still seeing them" show up in practice.
 
 ---
 
@@ -152,7 +172,7 @@ Computed asynchronously, not on the request path — recommendation queries are 
 
 - A background job periodically computes candidates per user (e.g. mutual-follower / "friend of a friend" overlap, or general high-engagement accounts as a fallback for users with a sparse graph).
 - Results are cached (Redis or a `suggested_users` cache table) and simply read at request time.
-- Follow/unfollow actions from the suggestions widget are handled via a Livewire action — no full page reload, and the follow graph update should also trigger fan-out backfill for the newly followed user's recent posts (see Section 9, cold start logic applies here too for a "fresh follow").
+- Follow/unfollow actions from the suggestions widget are handled via a Livewire action — no full page reload. A follow triggers the backfill job described in Section 5.1 so the newly-followed account's recent posts appear immediately rather than only after their next post.
 
 ---
 
@@ -187,8 +207,8 @@ Computed asynchronously, not on the request path — recommendation queries are 
 |---|---|
 | DAU | 100k |
 | Read:Write ratio | 10:1 — architecture optimizes reads (cache-first) |
-| Feed read latency | Redis list fetch + batch hydrate — should stay sub-100ms under normal load |
-| Cache size per user | Capped at 800 post IDs via `LTRIM` |
+| Feed read latency | Redis sorted-set fetch + batch hydrate — should stay sub-100ms under normal load |
+| Cache size per user | Capped at 800 post IDs via `ZREMRANGEBYRANK` |
 | Write durability | `posts` table is source of truth; Redis is a derived, rebuildable cache |
 
 ---
@@ -198,13 +218,15 @@ Computed asynchronously, not on the request path — recommendation queries are 
 Coverage should concentrate where the architecture actually carries risk — fan-out correctness, cache/DB consistency, and blending order — rather than aiming for blanket coverage.
 
 **Unit level**
-- `FanoutPostJob`: correct follower set is queried; `LTRIM` cap (800) is enforced; job is idempotent if retried.
+- `FanoutPostJob`: correct follower set is queried; the 800-entry `ZREMRANGEBYRANK` cap is enforced; job is idempotent if retried.
+- `FollowBackfillJob` (Section 5.1): fetches exactly K most-recent posts from the followee, not their full history; backfilled posts land at the correct score/position in the sorted set regardless of insertion order.
 - Blending layer: sponsored posts land at the configured positions; suggested-users block is attached; each `FeedBlendingStrategy` implementation is testable in isolation from the others.
 
 **Integration level**
-- Post creation → queue → Redis: a follower's `user:{id}:feed` list is populated after the job runs (queue processed synchronously in the test environment).
-- Cold-start fallback: with the Redis list empty, a feed request falls back to the SQL query and repopulates the cache.
-- Follow/unfollow: graph update is reflected in the next blending call; a fresh follow's backfill behavior (flagged as an open question above) is verified against whichever decision is made.
+- Post creation → queue → Redis: a follower's `user:{id}:feed` sorted set is populated after the job runs (queue processed synchronously in the test environment).
+- Cold-start fallback: with the feed set empty, a feed request falls back to the SQL query and repopulates the cache.
+- Follow → backfill: following an account with existing posts surfaces those posts on the very next feed read, in correct chronological position — this is the regression test for the fresh-follow gap this section exists to close.
+- Unfollow: graph edge is removed; feed set is *not* actively scrubbed (by design, Section 5.1) — test asserts that behavior explicitly so it isn't "fixed" by accident later.
 
 **Data layer**
 - The unique composite index on `follows` rejects duplicate follow edges.

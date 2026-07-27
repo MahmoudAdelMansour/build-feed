@@ -154,4 +154,12 @@ so don't freak please. :)
 And also 'll consider the cold start Cold Starts:
 If Redis crashes or a user opens the app after 6 months of inactivity, their feed cache will be empty. The system must gracefully fall back to a SQL query (WHERE user_id IN (...) ORDER BY created_at DESC LIMIT 20) and re-populate Redis on the fly.
 
+I notice that one thing worth a second look: I noted the "fresh follow" case in Section 7 — when someone follows a new account, that account's recent posts won't be in the follower's Redis cache until their next post triggers fan-out, so the newly-followed person's back-catalog won't show up immediately. Worth deciding whether that's acceptable for the interview scope or needs a backfill step.
+`I need to update the architecture documentation`
+- adding backfill test coverage
+- Redis List → Sorted Set for user:{id}:feed, scored by created_at. A List only ever gets prepended to in real-time order, so there was no clean way to insert an old post into the right spot. A ZSET fixes that for free — insertion order stops mattering.
+- And new FollowBackfillJob (Section 5.1): fires on follow, ZADDs the followee's last ~30 posts into the follower's set with their real timestamps as scores, so they land in correct position automatically.
+
+- nfollow stays asymmetric on purpose — no active scrub, posts just age out via the existing trim. Called that out explicitly so it doesn't get "fixed" into an expensive scan-and-remove later.
+  Propagated the change everywhere it touched: the diagram, the write/read path commands, the non-functional table, and the testing section (added backfill test cases, turned the old "open question" integration test into a defined regression test).
 #### you can now look to the [ARCHITECTURE.md](ARCHITECTURE.md) and thank you for reading my funny mind storming, i hope you enjoy it and if you have any questions please ask me.
