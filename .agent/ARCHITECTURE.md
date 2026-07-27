@@ -1,0 +1,232 @@
+# Feed System — Architecture Document
+
+> Companion to `MINDSTORM_CONCEPTS.md`. This document turns the scoped decisions into a concrete architecture: data model, generation strategy, blending layer, failure modes, and front-end approach.
+
+---
+
+## 1. Overview
+
+The system is a social feed: users follow each other, and on open they see a blended stream of posts from people they follow, suggested accounts to follow, and sponsored posts. The brief is deliberately vague; scoping decisions below turn it into a buildable system rather than an open-ended one.
+
+**Core challenge:** feed generation is an aggregation problem — merging organic posts, ads, and suggestions from separate sources into one ordered, low-latency stream.
+
+---
+
+## 2. Scope & Assumptions
+
+These are the product decisions this architecture is built against. Changing any one of them changes the design meaningfully — they're listed here as the contract, not just notes.
+
+| Dimension | Decision | Why it matters architecturally |
+|---|---|---|
+| Ordering | Chronological (algorithmic ranking deferred) | Keeps the feed a simple sorted merge; ranking would require a scoring service |
+| Scale | 100k DAU, 10:1 read-to-write ratio | Confirms the system is read-heavy → optimize reads, tolerate slower writes |
+| Media | Text-only | No CDN/transcoding pipeline needed for MVP |
+| Engagement | None (no likes/comments/reposts) | No engagement-count fan-in or cache invalidation on interaction |
+| Sponsorship | Randomly injected every N posts | Blending layer can inject by position, not by relevance model |
+| Follow graph | Unidirectional (Twitter-style: follow ≠ followed back automatically) | `follows` is a directed edge table, not a symmetric friendship table |
+| Fan-out strategy | Push model (fan-out on write) | Optimizes for the read-heavy, app-open-latency-sensitive case |
+
+---
+
+## 3. High-Level Architecture
+
+```
+                        ┌────────────────────┐
+                        │      Client         │
+                        │ (Web / Livewire UI) │
+                        └─────────┬───────────┘
+                                  │ GET /feed
+                                  ▼
+                        ┌────────────────────┐
+                        │   Feed Controller   │
+                        │  (Blending Layer)   │
+                        └─────┬────────┬──────┘
+                 ┌────────────┘        └────────────┐
+                 ▼                                   ▼
+        ┌────────────────┐                  ┌──────────────────┐
+        │  Redis Feed     │                  │  Ad Server /      │
+        │  Cache          │                  │  Suggestions Job  │
+        │ user:{id}:feed  │                  │  (async, cached)  │
+        └───────┬─────────┘                  └──────────────────┘
+                 │ (miss → fallback)
+                 ▼
+        ┌────────────────┐
+        │  MySQL: posts,  │
+        │  follows, users │
+        └────────────────┘
+
+        ┌──────────────────────────────────────────────┐
+        │              Write Path (async)                │
+        │  Post created → posts table → FanoutPostJob     │
+        │  → queue → LPUSH into each follower's Redis list│
+        └──────────────────────────────────────────────┘
+```
+
+---
+
+## 4. Data Model
+
+Kept minimal and indexed for read performance, per the scoping decisions.
+
+**`users`**
+
+| Column | Type | Notes |
+|---|---|---|
+| id | bigint, PK | |
+| name | string | |
+| email | string, unique | |
+| created_at | timestamp | |
+
+**`follows`**
+
+| Column | Type | Notes |
+|---|---|---|
+| follower_id | bigint, FK → users.id | |
+| followee_id | bigint, FK → users.id | |
+| created_at | timestamp | |
+| — | unique composite index | `[follower_id, followee_id]` — prevents duplicate follows, and is the lookup path for fan-out |
+
+**`posts`**
+
+| Column | Type | Notes |
+|---|---|---|
+| id | bigint, PK | |
+| user_id | bigint, FK → users.id | |
+| content | text | text-only, per scope |
+| created_at | timestamp | index on `(user_id, created_at)` — supports the cold-start fallback query |
+
+**`sponsored_posts`**
+
+| Column | Type | Notes |
+|---|---|---|
+| id | bigint, PK | |
+| title | string | |
+| content | text | |
+| is_active | boolean | toggled from the admin panel |
+
+No engagement tables (likes/comments), no media tables — deliberately excluded per scope, not omitted by oversight. If engagement is added later, it's an additive migration, not a redesign.
+
+---
+
+## 5. Feed Generation: Push Model (Fan-out on Write)
+
+Chosen deliberately over the pull model, given the 10:1 read-heavy ratio — the cost of fan-out is paid once at write time so every subsequent read is a cheap Redis list fetch.
+
+**Write path:**
+1. Post is saved to the `posts` table (source of truth).
+2. A `FanoutPostJob` is dispatched to a queue — publishing a post must never block on fan-out.
+3. The job loads the author's follower IDs from `follows`.
+4. For each follower, `LPUSH user:{follower_id}:feed {post_id}`.
+5. `LTRIM user:{follower_id}:feed 0 799` — caps each cached feed at 800 entries so Redis memory stays bounded per user.
+
+**Read path:**
+1. Feed request fetches `user:{id}:feed` from Redis — a list of post IDs, no join needed.
+2. Post IDs are hydrated (batch fetch from `posts` or a post cache).
+3. Hydrated posts are handed to the blending layer (Section 6).
+
+Storing IDs rather than full post bodies in Redis keeps the cache small and avoids data duplication/staleness if a post is edited or deleted.
+
+---
+
+## 6. Feed Blending Layer
+
+The feed response is never a raw DB/cache result — it's assembled from three sources: the organic feed cache, the ad server, and the suggestions job.
+
+**Pattern choice: Strategy.** Even though ordering is chronological today, the blending rules (how many organic posts, how ads are positioned, whether suggestions appear) are exactly the part likely to change per user tier or future ranking mode. A `FeedBlendingStrategy` interface with a `StandardFeedStrategy` implementation now, and room for e.g. `PremiumFeedStrategy` (no ads) or `RankedFeedStrategy` (algorithmic) later, means that shift doesn't require touching the read/write path — only swapping the strategy.
+
+A simpler Pipeline (sequential transform chain) was considered and is architecturally cleaner for a single fixed blending rule, but Strategy is the better fit here specifically because the blending *rule itself* is expected to vary — by user type now, by ranking mode later.
+
+**Blending sequence for a feed request:**
+1. Fetch next batch of organic post IDs from the Redis feed list (e.g. 20).
+2. Fetch N sponsored posts from the ad server (active campaigns, randomly selected).
+3. Fetch suggested users from the precomputed suggestions cache.
+4. Interleave sponsored posts into the organic stream at fixed positions (e.g. slots 3 and 10).
+5. Attach the suggested-users block for sidebar rendering.
+6. Return the merged, ordered payload to the client.
+
+---
+
+## 7. Suggested Users
+
+Computed asynchronously, not on the request path — recommendation queries are too expensive to run per feed load.
+
+- A background job periodically computes candidates per user (e.g. mutual-follower / "friend of a friend" overlap, or general high-engagement accounts as a fallback for users with a sparse graph).
+- Results are cached (Redis or a `suggested_users` cache table) and simply read at request time.
+- Follow/unfollow actions from the suggestions widget are handled via a Livewire action — no full page reload, and the follow graph update should also trigger fan-out backfill for the newly followed user's recent posts (see Section 9, cold start logic applies here too for a "fresh follow").
+
+---
+
+## 8. Sponsored Posts
+
+- Managed independently of the organic post pipeline — `sponsored_posts` with an `is_active` flag, editable via the admin panel.
+- Injected at request time by the blending layer, not written into any user's Redis feed list — ads are stateless with respect to the follow graph, so they don't participate in fan-out.
+- Injection is positional per scope ("every N posts"), which keeps the ad-serving logic decoupled from any targeting/ranking model — a future targeted-ads version would only change *which* sponsored posts are selected, not how they're spliced in.
+
+---
+
+## 9. Failure Modes & Mitigations
+
+**The "Celebrity" Problem (fan-out bottleneck).** A pure push model breaks down for high-follower accounts — pushing to 100k+ Redis keys synchronously in one job spikes CPU/memory and delays the job queue for everyone else. Mitigation path (not required for the 100k-DAU MVP scope, but the design should not preclude it): a hybrid model — push for normal accounts, pull (fan-out on read, merged at request time) for accounts above a follower threshold. The Strategy pattern used for blending extends naturally to a `FeedSourceStrategy` making this swap contained.
+
+**Cold starts.** If Redis is empty for a user — first login, cache eviction, or Redis itself being down — the read path must not simply return an empty feed. Fallback: query `posts` directly (`WHERE user_id IN (followed_ids) ORDER BY created_at DESC LIMIT 20`), backed by the `(user_id, created_at)` index, serve that, and asynchronously repopulate the Redis list so subsequent reads hit cache again.
+
+---
+
+## 10. Front-End Architecture
+
+- **Admin (Filament):** resources for `Users`, `Posts`, and `Sponsored Posts` — gives fast CRUD for seeding mock data and managing ad campaigns without custom admin UI work.
+- **Feed (Tailwind, single column):** loop over the blended item list; standard posts and sponsored posts render through shared card components so visual distinction (e.g. a "Sponsored" label) is a template-level concern, not a data-level one.
+- **Sidebar:** suggested users list with a "Follow" action.
+- **Livewire:** follow/unfollow updates the feed and sidebar without a full page reload — chosen over a separate AJAX/JS layer to stay inside the Laravel-native stack.
+
+---
+
+## 11. Non-Functional Targets
+
+| Concern | Target / Approach |
+|---|---|
+| DAU | 100k |
+| Read:Write ratio | 10:1 — architecture optimizes reads (cache-first) |
+| Feed read latency | Redis list fetch + batch hydrate — should stay sub-100ms under normal load |
+| Cache size per user | Capped at 800 post IDs via `LTRIM` |
+| Write durability | `posts` table is source of truth; Redis is a derived, rebuildable cache |
+
+---
+
+## 12. Testing Strategy
+
+Coverage should concentrate where the architecture actually carries risk — fan-out correctness, cache/DB consistency, and blending order — rather than aiming for blanket coverage.
+
+**Unit level**
+- `FanoutPostJob`: correct follower set is queried; `LTRIM` cap (800) is enforced; job is idempotent if retried.
+- Blending layer: sponsored posts land at the configured positions; suggested-users block is attached; each `FeedBlendingStrategy` implementation is testable in isolation from the others.
+
+**Integration level**
+- Post creation → queue → Redis: a follower's `user:{id}:feed` list is populated after the job runs (queue processed synchronously in the test environment).
+- Cold-start fallback: with the Redis list empty, a feed request falls back to the SQL query and repopulates the cache.
+- Follow/unfollow: graph update is reflected in the next blending call; a fresh follow's backfill behavior (flagged as an open question above) is verified against whichever decision is made.
+
+**Data layer**
+- The unique composite index on `follows` rejects duplicate follow edges.
+- The `(user_id, created_at)` index on `posts` is confirmed via query plan to actually serve the fallback query — not just assumed present.
+
+**Load / performance**
+- This is where the 10:1 read-heavy assumption gets validated, not just stated: simulate concurrent feed reads at a load representative of 100k DAU and confirm the sub-100ms cache-hit target.
+- Fan-out job duration for a typical follower count. Celebrity-scale fan-out is explicitly *not* load-tested at MVP stage — it's out of scope until the hybrid model in Section 9 is built.
+
+**Manual / QA**
+- Filament CRUD flows for Users, Posts, Sponsored Posts.
+- Livewire follow interaction: feed and sidebar update without a full page reload.
+
+**Explicitly out of scope**, matching the product scope in Section 2: engagement metrics, media handling, algorithmic-ranking correctness. Testing effort shouldn't outpace what the product actually does yet.
+
+---
+
+## 13. Future Evolution
+
+The design intentionally leaves these seams open, without building them prematurely:
+
+- **Algorithmic ranking:** swap the chronological `FeedBlendingStrategy` for a ranked one — the read/write/fan-out path doesn't change.
+- **Hybrid fan-out:** add a follower-count threshold to route celebrity accounts to pull-on-read instead of push-on-write.
+- **Engagement (likes/comments):** additive schema change; would introduce cache invalidation concerns for engagement counts shown in-feed, but doesn't touch the fan-out mechanism.
+- **Targeted ads:** replace random sponsored-post selection with a targeting query in the ad-fetch step of the blending layer — the injection mechanism itself is unchanged.
