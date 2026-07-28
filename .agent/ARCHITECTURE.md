@@ -252,3 +252,13 @@ The design intentionally leaves these seams open, without building them prematur
 - **Hybrid fan-out:** add a follower-count threshold to route celebrity accounts to pull-on-read instead of push-on-write.
 - **Engagement (likes/comments):** additive schema change; would introduce cache invalidation concerns for engagement counts shown in-feed, but doesn't touch the fan-out mechanism.
 - **Targeted ads:** replace random sponsored-post selection with a targeting query in the ad-fetch step of the blending layer — the injection mechanism itself is unchanged.
+
+---
+
+## 14. Implemented Testing
+
+A comprehensive suite of unit and feature tests has been implemented to ensure the correctness of the system.
+
+- **Unit Tests:** Cover model relationships, job operations (fan-out and backfill), and the feed blending strategy.
+- **Feature Tests:** Cover feed generation (including cache fallback), the follow/unfollow flow, and API endpoint authentication.
+- **Tools:** PHPUnit, Mockery for mocking services, and Laravel's built-in testing helpers for database and queue faking.
